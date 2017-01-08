@@ -115,9 +115,18 @@ public class AsyncPublisher<T> implements Publisher<T>, Closeable {
     // This is our implementation of the Reactive Streams `Subscription`,
     // which represents the association between a `Publisher` and a `Subscriber`.
     final class SubscriptionImpl implements Subscription, Runnable {
-        final Subscriber<? super T> subscriber; // We need a reference to the `Subscriber` so we can talk to it
-        private AtomicBoolean cancelled = new AtomicBoolean(false); // This flag will track whether this `Subscription` is to be considered cancelled or not
+
+        private final Subscriber<? super T> subscriber; // We need a reference to the `Subscriber` so we can talk to it
+        private final AtomicBoolean cancelled = new AtomicBoolean(false); // This flag will track whether this `Subscription` is to be considered cancelled or not
         private final AtomicBoolean resourceClosed = new AtomicBoolean(false);
+
+        // This `ConcurrentLinkedQueue` will track signals that are sent to this `Subscription`, like `request` and `cancel`
+        private final ConcurrentLinkedQueue<Signal> inboundSignals = new ConcurrentLinkedQueue<Signal>();
+
+        // We are using this `AtomicBoolean` to make sure that this `Subscription` doesn't run concurrently with itself,
+        // which would violate rule 1.3 among others (no concurrent notifications).
+        private final AtomicBoolean on = new AtomicBoolean(false);
+
         private long demand = 0; // Here we track the current demand, i.e. what has been requested but not yet delivered
         private Iterator<T> iterator; // This is our cursor into the data stream, which we will send to the `Subscriber`
 
@@ -127,12 +136,58 @@ public class AsyncPublisher<T> implements Publisher<T>, Closeable {
             this.subscriber = subscriber;
         }
 
-        // This `ConcurrentLinkedQueue` will track signals that are sent to this `Subscription`, like `request` and `cancel`
-        private final ConcurrentLinkedQueue<Signal> inboundSignals = new ConcurrentLinkedQueue<Signal>();
+        // -------------------------------------
+        // Subscription APIs
+        // -------------------------------------
 
-        // We are using this `AtomicBoolean` to make sure that this `Subscription` doesn't run concurrently with itself,
-        // which would violate rule 1.3 among others (no concurrent notifications).
-        private final AtomicBoolean on = new AtomicBoolean(false);
+        // Our implementation of `Subscription.request` sends a signal to the Subscription that more elements are in demand
+        @Override
+        public void request(final long n) {
+            signal(new Request(n));
+        }
+
+        // Our implementation of `Subscription.cancel` sends a signal to the Subscription that the `Subscriber` is not interested in any more elements
+        @Override
+        public void cancel() {
+            signal(Cancel.Instance);
+        }
+
+        // -------------------------------------
+        // Runnable APIs
+        // -------------------------------------
+
+        // This is the main "event loop" if you so will
+        @Override
+        public final void run() {
+            if (on.get()) { // establishes a happens-before relationship with the end of the previous run
+                try {
+                    final Signal s = inboundSignals.poll(); // We take a signal off the queue
+                    if (cancelled.get() == false) { // to make sure that we follow rule 1.8, 3.6 and 3.7
+
+                        // Below we simply unpack the `Signal`s and invoke the corresponding methods
+                        if (s instanceof Request) {
+                            doRequest(((Request) s).getN());
+                        } else if (s == Send.Instance) {
+                            doSend();
+                        } else if (s == Cancel.Instance) {
+                            doCancel();
+                        } else if (s == Subscribe.Instance) {
+                            doSubscribe();
+                        }
+                    }
+                } finally {
+                    on.set(false); // establishes a happens-before relationship with the beginning of the next run
+                    if (!inboundSignals.isEmpty()) {
+                        // If we still have signals to process
+                        tryScheduleToExecute(); // Then we try to schedule ourselves to execute again
+                    }
+                }
+            }
+        }
+
+        // -------------------------------------
+        // Internal APIs
+        // -------------------------------------
 
         // This method will register inbound demand from our `Subscriber` and validate it against rule 3.9 and rule 3.17
         private void doRequest(final long n) {
@@ -209,7 +264,7 @@ public class AsyncPublisher<T> implements Publisher<T>, Closeable {
         private void doSend() {
             try {
                 // In order to play nice with the `Executor` we will only send at-most `batchSize` before
-                // rescheduing ourselves and relinquishing the current thread.
+                // rescheduling ourselves and relinquishing the current thread.
                 int leftInBatch = batchSize;
                 do {
                     T next;
@@ -277,35 +332,6 @@ public class AsyncPublisher<T> implements Publisher<T>, Closeable {
             }
         }
 
-        // This is the main "event loop" if you so will
-        @Override
-        public final void run() {
-            if (on.get()) { // establishes a happens-before relationship with the end of the previous run
-                try {
-                    final Signal s = inboundSignals.poll(); // We take a signal off the queue
-                    if (cancelled.get() == false) { // to make sure that we follow rule 1.8, 3.6 and 3.7
-
-                        // Below we simply unpack the `Signal`s and invoke the corresponding methods
-                        if (s instanceof Request) {
-                            doRequest(((Request) s).getN());
-                        } else if (s == Send.Instance) {
-                            doSend();
-                        } else if (s == Cancel.Instance) {
-                            doCancel();
-                        } else if (s == Subscribe.Instance) {
-                            doSubscribe();
-                        }
-                    }
-                } finally {
-                    on.set(false); // establishes a happens-before relationship with the beginning of the next run
-                    if (!inboundSignals.isEmpty()) {
-                        // If we still have signals to process
-                        tryScheduleToExecute(); // Then we try to schedule ourselves to execute again
-                    }
-                }
-            }
-        }
-
         // This method makes sure that this `Subscription` is only running on one Thread at a time,
         // this is important to make sure that we follow rule 1.3
         private final void tryScheduleToExecute() {
@@ -326,18 +352,6 @@ public class AsyncPublisher<T> implements Publisher<T>, Closeable {
                     }
                 }
             }
-        }
-
-        // Our implementation of `Subscription.request` sends a signal to the Subscription that more elements are in demand
-        @Override
-        public void request(final long n) {
-            signal(new Request(n));
-        }
-
-        // Our implementation of `Subscription.cancel` sends a signal to the Subscription that the `Subscriber` is not interested in any more elements
-        @Override
-        public void cancel() {
-            signal(Cancel.Instance);
         }
 
         // The reason for the `init` method is that we want to ensure the `SubscriptionImpl`

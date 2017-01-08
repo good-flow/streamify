@@ -1,5 +1,7 @@
 package somewhere;
 
+import com.goodflow.streamify.concurrent.DaemonExecutorService;
+import com.goodflow.streamify.concurrent.DaemonExecutors;
 import com.goodflow.streamify.publisher.AsyncPublisher;
 import com.goodflow.streamify.publisher.resource.JdbcResource;
 import lombok.extern.slf4j.Slf4j;
@@ -13,8 +15,6 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
-import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
 
 @Slf4j
 @RunWith(JUnit4.class)
@@ -34,6 +34,7 @@ public class JdbcResourceTest {
 
     @Test
     public void sync() throws Exception {
+        DaemonExecutorService publisherExecutor = DaemonExecutors.newFixedThreadPool(3);
         try (Connection conn = acquireConnection()) {
             prepareTable(conn);
 
@@ -49,7 +50,6 @@ public class JdbcResourceTest {
                     throw new RuntimeException(e);
                 }
             });
-            Executor publisherExecutor = Executors.newFixedThreadPool(3);
             AsyncPublisher<Person> publisher = AsyncPublisher.jdbc(resource).executor(publisherExecutor).build();
 
             SyncSubscriber<Person> subscriber = new SyncSubscriber<Person>() {
@@ -58,15 +58,21 @@ public class JdbcResourceTest {
                     log.info("person (sync): {}", person);
                     return true;
                 }
+
+                @Override
+                public void onComplete() {
+                    publisherExecutor.shutdownNow();
+                }
             };
             publisher.subscribe(subscriber);
-            Thread.sleep(1000);
         }
 
     }
 
     @Test
     public void async() throws Exception {
+        DaemonExecutorService publisherExecutor = DaemonExecutors.newFixedThreadPool(3);
+        DaemonExecutorService subscriberExecutor = DaemonExecutors.newFixedThreadPool(3);
         try (Connection conn = acquireConnection()) {
             prepareTable(conn);
 
@@ -82,22 +88,25 @@ public class JdbcResourceTest {
                     throw new RuntimeException(e);
                 }
             });
-            Executor publisherExecutor = Executors.newFixedThreadPool(3);
+
             AsyncPublisher<Person> publisher = AsyncPublisher.jdbc(resource).executor(publisherExecutor).build();
 
-            Executor subscriberExecutor = Executors.newFixedThreadPool(3);
             AsyncSubscriber<Person> subscriber = new AsyncSubscriber<Person>(subscriberExecutor) {
                 @Override
                 protected boolean whenNext(Person person) {
                     log.info("person (async): {}", person);
                     return true;
                 }
+
+                @Override
+                protected void whenComplete() {
+                    publisherExecutor.shutdownNow();
+                    subscriberExecutor.shutdownNow();
+                }
             };
 
             publisher.subscribe(subscriber);
-            Thread.sleep(1000);
         }
-
     }
 
 }
